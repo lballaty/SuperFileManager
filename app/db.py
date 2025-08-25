@@ -1,4 +1,4 @@
-import sqlite3, pathlib, os
+import sqlite3, pathlib, os, json
 
 PRAGMAS = [
  "PRAGMA journal_mode=WAL;",
@@ -78,3 +78,21 @@ def counts_for_root(con, root: str) -> dict:
     return {"files_total": files_total, "files_text": files_text,
             "chunks": chunks, "last_indexed_at": last_idx}
 
+# settings helpers
+
+def ensure_settings(con):
+    con.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT)")
+    con.commit()
+
+def get_setting(con, k, default=None):
+    ensure_settings(con)
+    row = con.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
+    return json.loads(row[0]) if row else default
+
+def set_setting(con, k, value):
+    ensure_settings(con)
+    con.execute(
+        "INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        (k, json.dumps(value)),
+    )
+    con.commit()
