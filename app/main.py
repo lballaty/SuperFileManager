@@ -1,3 +1,5 @@
+# app/main.py  — threaded indexing + separate DB connections + progress queue
+
 import os, sqlite3, threading, queue, tkinter as tk, tkinter.scrolledtext as sc
 from tkinter import filedialog, messagebox
 from . import db, indexer, searcher
@@ -5,22 +7,31 @@ from . import db, indexer, searcher
 IS_MAC = (os.uname().sysname == "Darwin")
 DB_PATH = (os.path.expanduser("~/Library/Application Support/SuperFileManager/state.sqlite")
            if IS_MAC else os.path.expanduser("~/.local/share/SuperFileManager/state.sqlite"))
-EXCLUDES = [".git","node_modules","dist","build","__pycache__","/proc","/sys","/dev","/Volumes",
+
+EXCLUDES = [".git","node_modules","dist","build","__pycache__",
+            "/proc","/sys","/dev","/Volumes",
             "C:\\Windows","C:\\Program Files","C:\\ProgramData"]
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SuperFileManager"); self.geometry("900x600")
+
+        # ——— DB in UI thread (read/search only) ———
         self.db_path = DB_PATH
-        # UI thread connection (reads/search). Do not share across threads.
         self.con: sqlite3.Connection = db.connect(self.db_path)
         db.init(self.con)
+        # If you added migrate() per checksum feature:
+        try: db.migrate(self.con)
+        except Exception: pass
 
+        # ——— worker comms ———
         self.work_q: "queue.Queue[tuple[str,dict]]" = queue.Queue()
         self.worker: threading.Thread | None = None
+
+        # ——— UI ———
         self._build()
-        self.after(150, self._poll)
+        self.after(150, self._poll)  # periodic queue reader
 
     def _build(self):
         top = tk.Frame(self); top.pack(fill="x", padx=8, pady=6)
@@ -46,25 +57,32 @@ class App(tk.Tk):
         p = filedialog.askdirectory(initialdir=self.root_var.get())
         if p: self.root_var.set(p)
 
-    # threaded indexing
+    # ——— THREADED INDEXING ———
     def index_threaded(self):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Index", "Index already running"); return
         root = self.root_var.get().strip()
         if not root or not os.path.isdir(root):
             messagebox.showerror("Error", "Invalid directory"); return
+
         self._lock_ui(True)
         self.status.config(text=f"Indexing {root} …")
 
-        def progress(ev: dict):
+        def progress(ev: dict):  # called inside worker thread
             self.work_q.put(("progress", ev))
 
         def job():
             try:
-                # Open a NEW connection in this worker thread
+                # NEW connection in this thread. Do not share UI thread connection.
                 wcon = db.connect(self.db_path, check_same_thread=False)
                 db.init(wcon)
-                indexer.index_root(wcon, root, EXCLUDES, progress_cb=progress, batch=200)
+                try: db.migrate(wcon)
+                except Exception: pass
+                indexer.index_root(
+                    wcon, root, EXCLUDES,
+                    progress_cb=progress, batch=200,
+                    prune_missing=False  # set True if you want deletions pruned
+                )
                 wcon.close()
             finally:
                 self.work_q.put(("done", {}))
@@ -81,19 +99,23 @@ class App(tk.Tk):
             while True:
                 what, data = self.work_q.get_nowait()
                 if what == "progress":
-                    f = data.get("files",0); c = data.get("chunks",0); s = data.get("secs",0)
-                    self.status.config(text=f"Indexing… files={f} chunks={c} t={s}s")
+                    f_seen = data.get("files_seen") or data.get("files", 0)
+                    f_idx  = data.get("files_indexed", 0)
+                    chunks = data.get("chunks", 0)
+                    secs   = data.get("secs", 0)
+                    self.status.config(text=f"Indexing… seen={f_seen} indexed={f_idx} chunks={chunks} t={secs}s")
                 elif what == "done":
                     self.status.config(text="Index complete")
                     self._lock_ui(False)
         except queue.Empty:
             pass
         self.after(150, self._poll)
+    # ——— /THREADED INDEXING ———
 
     def search(self):
         q = self.q_var.get().strip()
         if not q: return
-        rows = searcher.fts(self.con, q, top_k=500)
+        rows = searcher.fts(self.con, q, top_k=200)  # adjust top_k as desired
         if self.regex_var.get(): rows = searcher.regex_filter(rows, q)
         self.listbox.delete(0, tk.END); self.preview.delete("1.0", tk.END)
         for cid, ord_, text, path in rows[:300]:
