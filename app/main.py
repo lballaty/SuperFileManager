@@ -1,4 +1,5 @@
 # app/main.py  — threaded indexing + separate DB connections + progress queue
+# app/main.py  — threaded indexing + separate DB connections + progress queue
 
 import os, sqlite3, threading, queue, tkinter as tk, tkinter.scrolledtext as sc
 from tkinter import filedialog, messagebox
@@ -81,7 +82,7 @@ class App(tk.Tk):
                 indexer.index_root(
                     wcon, root, EXCLUDES,
                     progress_cb=progress, batch=200,
-                    prune_missing=False  # set True if you want deletions pruned
+                    prune_missing=True  # set True if you want deletions pruned
                 )
                 wcon.close()
             finally:
