@@ -10,6 +10,16 @@ SAMPLE_HEAD_MB_DEFAULT = 4
 SAMPLE_TAIL_MB_DEFAULT = 4
 SAMPLE_STRIDE_DEFAULT  = 0.01   # 1%
 
+
+def _get_created_at(st) -> int | None:
+    try:
+        return int(st.st_birthtime)    # macOS
+    except AttributeError:
+        pass
+    if os.name == "nt":
+        return int(st.st_ctime)        # Windows creation time
+    return None                         # Linux often unavailable
+
 def _blake3_file(path, size, sample=True,
                  large_mb=LARGE_MB_DEFAULT,
                  head_mb=SAMPLE_HEAD_MB_DEFAULT,
@@ -100,6 +110,11 @@ def index_root(
                     cur.execute("UPDATE files SET last_seen=?, status='ok' WHERE path=?", (now, fp))
                 else:
                     fid = _upsert_meta(cur, fp, st)
+
+                    ca = _get_created_at(st)
+                    if ca is not None:
+                        cur.execute("UPDATE files SET created_at=? WHERE id=?", (ca, fid))
+
 
                     # checksum lane
                     same_hash = False

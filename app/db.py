@@ -12,7 +12,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS files(
   id INTEGER PRIMARY KEY,
   path TEXT UNIQUE,
-  size INTEGER, mtime INTEGER, inode TEXT,
+  size INTEGER, mtime INTEGER, created_at INTEGER, inode TEXT,
   mime TEXT, sha1 TEXT, status TEXT, last_seen INTEGER
 );
 CREATE TABLE IF NOT EXISTS chunks(
@@ -26,6 +26,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
 CREATE TABLE IF NOT EXISTS fts_map(rowid INTEGER PRIMARY KEY, chunk_id INTEGER UNIQUE);
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
 """
+
 
 def connect(db_path: str, *, check_same_thread: bool = True, timeout: float = 30.0) -> sqlite3.Connection:
     pathlib.Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -45,11 +46,15 @@ def _ensure_column(con, table, col, decl):
         con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 def migrate(con):
-    # new metadata
     _ensure_column(con, "files", "blake3", "TEXT")
     _ensure_column(con, "files", "hash_checked_at", "INTEGER")
     _ensure_column(con, "files", "last_indexed_at", "INTEGER")
+    _ensure_column(con, "files", "created_at", "INTEGER")  # NEW
+
+    con.execute("CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at)")
     con.commit()
+
 
 
 def counts_for_root(con, root: str) -> dict:

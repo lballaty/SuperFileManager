@@ -1,12 +1,15 @@
 # app/main.py
 import os, sqlite3, threading, queue, tkinter as tk, tkinter.scrolledtext as sc
 from tkinter import filedialog, messagebox
-import re
+import re, time
 from . import db, indexer, searcher
 
 IS_MAC = (os.uname().sysname == "Darwin")
 DB_PATH = (os.path.expanduser("~/Library/Application Support/SuperFileManager/state.sqlite")
            if IS_MAC else os.path.expanduser("~/.local/share/SuperFileManager/state.sqlite"))
+
+CREATED_SUPPORTED = IS_MAC or (os.name == "nt")
+
 
 EXCLUDES = [".git","node_modules","dist","build","__pycache__",
             "/proc","/sys","/dev","/Volumes",
@@ -65,6 +68,30 @@ class App(tk.Tk):
         tk.Checkbutton(mid, text="Regex", variable=self.regex_var).pack(side="left", padx=(8,0))
         tk.Button(mid, text="Regex Builder…", command=self.open_regex_builder).pack(side="left", padx=6)
 
+        # time filter row
+        trow = tk.Frame(self); trow.pack(fill="x", padx=8, pady=(4,0))
+        tk.Label(trow, text="Time filter").pack(side="left")
+
+        self.time_preset = tk.StringVar(value="All")
+        presets = ["All","Last 24 hours","Last 7 days","Last 30 days","Custom"]
+        tk.OptionMenu(trow, self.time_preset, *presets).pack(side="left", padx=6)
+
+        # custom range controls
+        self.custom_num = tk.IntVar(value=7)
+        self.custom_unit = tk.StringVar(value="days")
+        units = ["minutes","hours","days","weeks","months","years"]
+        tk.Spinbox(trow, from_=1, to=9999, width=6, textvariable=self.custom_num).pack(side="left")
+        tk.OptionMenu(trow, self.custom_unit, *units).pack(side="left", padx=6)
+
+        # primary time field
+        tk.Label(trow, text="Field").pack(side="left", padx=(12,2))
+        self.time_field = tk.StringVar(value="modified")
+        tk.OptionMenu(trow, self.time_field, "modified","created").pack(side="left")
+
+        # fallback notice
+        self.fallback_var = tk.StringVar(value="")
+        tk.Label(trow, textvariable=self.fallback_var, fg="orange").pack(side="left", padx=12)
+
         # scope selector
         scope = tk.Frame(self); scope.pack(fill="x", padx=8, pady=(8,4))
         tk.Label(scope, text="Search scope (directories, recursive):").pack(side="left")
@@ -90,6 +117,24 @@ class App(tk.Tk):
         self.split.add(self.listbox); self.split.add(self.preview)
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+
+    def _compute_min_ts(self) -> tuple[int|None, str]:
+        p = self.time_preset.get()
+        if p == "All":
+            return None, self.time_field.get()
+        if p == "Last 24 hours":
+            return int(time.time()) - 24*3600, self.time_field.get()
+        if p == "Last 7 days":
+            return int(time.time()) - 7*24*3600, self.time_field.get()
+        if p == "Last 30 days":
+            return int(time.time()) - 30*24*3600, self.time_field.get()
+        # Custom
+        n = max(1, int(self.custom_num.get()))
+        mul = {"minutes":60, "hours":3600, "days":86400,
+            "weeks":7*86400, "months":30*86400, "years":365*86400}[self.custom_unit.get()]
+        return int(time.time()) - n*mul, self.time_field.get()
+
 
     # —— scope handlers ——
     def add_scope_dir(self):
@@ -187,14 +232,36 @@ class App(tk.Tk):
     # —— search ——
     def search(self):
         q = self.q_var.get().strip()
-        if not q: return
-        rows = searcher.fts(self.con, q, top_k=200, path_prefixes=self.scopes)
+        if not q:
+            return
+
+        # compute time lower bound and chosen field
+        min_ts, field = self._compute_min_ts()
+
+        # created→modified fallback notice
+        used_field = field
+        self.fallback_var.set("")
+        if field == "created" and not CREATED_SUPPORTED:
+            used_field = "modified"
+            self.fallback_var.set("Created time unsupported on this OS. Using modified.")
+
+        # run search with scopes + time filter
+        rows = searcher.fts(
+            self.con, q, top_k=200,
+            path_prefixes=self.scopes,
+            min_ts=min_ts,
+            time_field=used_field,
+        )
+
         if self.regex_var.get():
             rows = searcher.regex_filter(rows, q)
-        self.listbox.delete(0, tk.END); self.preview.delete("1.0", tk.END)
+
+        self.listbox.delete(0, tk.END)
+        self.preview.delete("1.0", tk.END)
         for cid, ord_, text, path in rows[:300]:
             self.listbox.insert(tk.END, f"{path}  [chunk {ord_}]  {text[:120]}…")
-        self.status.config(text=f"{min(300,len(rows))} results")
+        self.status.config(text=f"{min(300, len(rows))} results")
+
 
     def show_preview(self, _evt=None):
         sel = self.listbox.curselection()
