@@ -1,4 +1,4 @@
-import sqlite3, pathlib
+import sqlite3, pathlib, os
 
 PRAGMAS = [
  "PRAGMA journal_mode=WAL;",
@@ -51,4 +51,30 @@ def migrate(con):
     _ensure_column(con, "files", "last_indexed_at", "INTEGER")
     con.commit()
 
+
+def counts_for_root(con, root: str) -> dict:
+    root_abs = os.path.abspath(root)
+    sep = "\\" if os.name == "nt" else "/"
+    prefix = root_abs if root_abs.endswith(sep) else root_abs + sep
+    like = prefix + "%"
+
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM files WHERE path LIKE ?", (like,))
+    files_total = cur.fetchone()[0]
+
+    cur.execute("""SELECT COUNT(DISTINCT c.file_id)
+                   FROM chunks c JOIN files f ON f.id = c.file_id
+                   WHERE f.path LIKE ?""", (like,))
+    files_text = cur.fetchone()[0]
+
+    cur.execute("""SELECT COUNT(*)
+                   FROM chunks c JOIN files f ON f.id = c.file_id
+                   WHERE f.path LIKE ?""", (like,))
+    chunks = cur.fetchone()[0]
+
+    cur.execute("SELECT MAX(last_indexed_at) FROM files WHERE path LIKE ?", (like,))
+    last_idx = cur.fetchone()[0]
+
+    return {"files_total": files_total, "files_text": files_text,
+            "chunks": chunks, "last_indexed_at": last_idx}
 
