@@ -1,6 +1,9 @@
 # app/searcher.py
 import os, sqlite3, re
 from typing import Iterable, Optional, List
+from .logging_conf import get_logger
+log = get_logger("searcher")
+
 
 def _norm_prefix(p: str) -> str:
     absp = os.path.abspath(p)
@@ -33,50 +36,71 @@ def _normalize_fts_query(q: str) -> Optional[str]:
     # Otherwise quote as a phrase so special chars don't break MATCH
     return f"\"{s.replace('\"', '\"\"')}\""
 
+
 def fts(
     con: sqlite3.Connection,
     q: str,
     top_k: int = 200,
     *,
     path_prefixes: Optional[List[str]] = None,
-    min_ts: Optional[int] = None,           # optional time cutoff (epoch seconds)
+    min_ts: Optional[int] = None,           # epoch seconds
     time_field: str = "modified",           # "modified" or "created"
 ) -> list[tuple]:
-    """
-    Returns best chunk per file. Row: (chunk_id, ord, text, path)
-    """
     cur = con.cursor()
     col = "f.mtime" if time_field == "modified" else "f.created_at"
     qn = _normalize_fts_query(q)
+    log.debug(f"fts args q={q!r} top_k={top_k} min_ts={min_ts} field={time_field} scopes={len(path_prefixes or [])}")
+
+
+    # Build scope SQL
+    prefixes = [_norm_prefix(p) for p in (path_prefixes or [])]
+    scope_sql = ""
+    scope_params: List[str] = []
+    if prefixes:
+        scope_sql = "(" + " OR ".join(["f.path LIKE ?"] * len(prefixes)) + ")"
+        scope_params = [p + "%" for p in prefixes]
 
     if qn is None:
-        # Show-all: newest files' first chunk (ord=0), scoped and time-filtered
+        # SHOW-ALL: first chunk per file, newest first, WITH scope/time in SQL
+        where = ["c.ord = 0"]
+        params: List[object] = []
+        if min_ts is not None:
+            where.append(f"{col} >= ?"); params.append(min_ts)
+        if scope_sql:
+            where.append(scope_sql); params.extend(scope_params)
         sql = f"""SELECT c.id
                   FROM chunks c
                   JOIN files f ON f.id = c.file_id
-                  WHERE c.ord = 0
-                    {"AND " + col + " >= ? " if min_ts is not None else ""}
+                  WHERE {" AND ".join(where) if where else "1=1"}
                   ORDER BY {col} DESC
                   LIMIT ?"""
-        params = ([min_ts] if min_ts is not None else []) + [top_k]
+        params.append(top_k)
         cur.execute(sql, tuple(params))
         ids = [r[0] for r in cur.fetchall()]
     else:
-        # Normal FTS query
+        # FTS mode: rank, WITH scope/time in SQL
+        where = ["fts MATCH ?"]
+        params: List[object] = [qn]
+        if min_ts is not None:
+            where.append(f"{col} >= ?"); params.append(min_ts)
+        if scope_sql:
+            where.append(scope_sql); params.extend(scope_params)
         sql = f"""SELECT m.chunk_id, bm25(fts) AS score
                   FROM fts
                   JOIN fts_map m ON m.rowid = fts.rowid
                   JOIN chunks c  ON c.id    = m.chunk_id
                   JOIN files  f  ON f.id    = c.file_id
-                  WHERE fts MATCH ?
-                    {"AND " + col + " >= ? " if min_ts is not None else ""}
+                  WHERE {" AND ".join(where)}
                   ORDER BY score
                   LIMIT ?"""
-        params = [qn] + ([min_ts] if min_ts is not None else []) + [top_k]
+        params.append(top_k)
         cur.execute(sql, tuple(params))
         ids = [r[0] for r in cur.fetchall()]
+        log.debug(f"fts ids={len(ids)}")
+
 
     if not ids:
+        log.debug(f"fts files={len(best)}")
         return []
 
     ph = ",".join("?" * len(ids))
@@ -85,18 +109,15 @@ def fts(
                     WHERE c.id IN ({ph})""", ids)
     rows = cur.fetchall()
 
-    # keep returned order
     order = {cid: i for i, cid in enumerate(ids)}
     rows.sort(key=lambda r: order.get(r[0], 1e9))
 
-    # scope filter and best-per-file
-    prefixes = [_norm_prefix(p) for p in (path_prefixes or [])]
+    # best chunk per file
     best = {}
     for cid, ord_, text, path in rows:
-        if not _in_scopes(path, prefixes):
-            continue
         best.setdefault(path, (cid, ord_, text, path))
     return list(best.values())
+
 
 def regex_filter(rows: Iterable[tuple], pattern: str, flags: int = re.IGNORECASE):
     rx = re.compile(pattern, flags)

@@ -1,6 +1,8 @@
 # app/main.py
 import os, sqlite3, threading, queue, tkinter as tk, tkinter.scrolledtext as sc
 from tkinter import filedialog, messagebox
+import logging
+from .logging_conf import get_logger, log_path
 import re, time
 from . import db, indexer, searcher
 
@@ -31,6 +33,11 @@ class App(tk.Tk):
         # load search scopes from settings
         self.scopes = db.get_setting(self.con, "search_scopes", [])
 
+        # debug logging setting
+        self.debug_var = tk.BooleanVar(value=db.get_setting(self.con, "debug_logging", False))
+        self.log = get_logger("GUI", level=(logging.DEBUG if self.debug_var.get() else logging.WARNING))
+
+
         self._build()
         self.after(150, self._poll)
         self.update_stats()
@@ -44,6 +51,15 @@ class App(tk.Tk):
         self.btn_index = tk.Button(top, text="Index", command=self.index_threaded); self.btn_index.pack(side="left", padx=6)
         self.btn_cancel = tk.Button(top, text="Cancel", command=self.cancel_index, state="disabled")
         self.btn_cancel.pack(side="left")
+        self.bind_all("<Control-l>", lambda _e: self.clear_results())
+
+    def _toggle_logging(self):
+        import logging as _lg
+        db.set_setting(self.con, "debug_logging", bool(self.debug_var.get()))
+        level = _lg.DEBUG if self.debug_var.get() else _lg.WARNING
+        self.log = get_logger("GUI", level=level)
+
+
 
         # knobs row (reindex + verify + prune + fullhash)
         knobs = tk.Frame(self); knobs.pack(fill="x", padx=8)
@@ -64,6 +80,12 @@ class App(tk.Tk):
         e = tk.Entry(mid, textvariable=self.q_var, width=60); e.pack(side="left", padx=4)
         e.bind("<Return>", lambda _e: self.search())
         tk.Button(mid, text="Search", command=self.search).pack(side="left")
+        tk.Button(mid, text="Clear", command=self.clear_results).pack(side="left", padx=(6,0))
+        self.auto_clear_var = tk.BooleanVar(value=db.get_setting(self.con, "auto_clear", True))
+        tk.Checkbutton(mid, text="Auto-clear", variable=self.auto_clear_var).pack(side="left", padx=(8,0))
+        self.auto_clear_var.trace_add(
+            "write", lambda *_: db.set_setting(self.con, "auto_clear", bool(self.auto_clear_var.get()))
+        )
         self.regex_var = tk.BooleanVar()
         tk.Checkbutton(mid, text="Regex", variable=self.regex_var).pack(side="left", padx=(8,0))
         tk.Button(mid, text="Regex Builder…", command=self.open_regex_builder).pack(side="left", padx=6)
@@ -117,6 +139,14 @@ class App(tk.Tk):
         self.split.add(self.listbox); self.split.add(self.preview)
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def clear_results(self):
+        self.q_var.set("")
+        self.listbox.delete(0, tk.END)
+        self.preview.delete("1.0", tk.END)
+        if hasattr(self, "fallback_var"): self.fallback_var.set("")
+        self.status.config(text="Ready")
+    
 
 
     def _compute_min_ts(self) -> tuple[int|None, str]:
@@ -198,6 +228,7 @@ class App(tk.Tk):
             finally:
                 self.work_q.put(("done", {}))
 
+        self.log.debug(f"INDEX start root={root} prune={self.prune_var.get()} reindex_days={int(self.reindex_days.get())} verify_days={int(self.verify_days.get())} fullhash={bool(self.fullhash_var.get())}")
         self.worker = threading.Thread(target=job, daemon=True)
         self.worker.start()
         self.btn_cancel.config(state="normal")
@@ -221,22 +252,35 @@ class App(tk.Tk):
                     chunks = data.get("chunks", 0)
                     secs   = data.get("secs", 0)
                     self.status.config(text=f"Indexing… seen={f_seen} indexed={f_idx} chunks={chunks} t={secs}s")
+                    self.log.debug(f"PROG seen={f_seen} idx={f_idx} chunks={chunks} t={secs}s")
+
                 elif what == "done":
                     self.status.config(text="Index complete" + (" (cancelled)" if data.get("cancelled") else ""))
                     self._lock_ui(False)
                     self.update_stats()
+                    self.log.debug("INDEX done")
+
         except queue.Empty:
             pass
         self.after(150, self._poll)
 
     # —— search ——
+
     def search(self):
+        self.log.debug("SEARCH click")
+        if getattr(self, "auto_clear_var", None) and self.auto_clear_var.get():
+            self.listbox.delete(0, tk.END)
+            self.preview.delete("1.0", tk.END)
+            if hasattr(self, "fallback_var"): self.fallback_var.set("")
+
         q = self.q_var.get().strip()
         if not q:
+            self.status.config(text="Ready")
             return
 
         # compute time lower bound and chosen field
         min_ts, field = self._compute_min_ts()
+        self.log.debug(f"SEARCH start q={q} min_ts={min_ts} field={field} scopes={self.scopes} regex={self.regex_var.get()}")
 
         # created→modified fallback notice
         used_field = field
@@ -261,6 +305,7 @@ class App(tk.Tk):
         for cid, ord_, text, path in rows[:300]:
             self.listbox.insert(tk.END, f"{path}  [chunk {ord_}]  {text[:120]}…")
         self.status.config(text=f"{min(300, len(rows))} results")
+        self.log.debug(f"SEARCH query={q} results={len(rows)}")
 
 
     def show_preview(self, _evt=None):

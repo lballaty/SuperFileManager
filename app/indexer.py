@@ -3,6 +3,9 @@
 import os, time, stat, sqlite3, threading
 from blake3 import blake3
 from . import extract
+from .logging_conf import get_logger
+log = get_logger("indexer")
+
 
 # Defaults (overridable via function args)
 LARGE_MB_DEFAULT       = 64
@@ -73,6 +76,9 @@ def index_root(
     # cancel
     stop_event: threading.Event | None = None,
 ):
+    log.debug(f"index_root root={root} prune={prune_missing} reindex_days={reindex_days} verify_days={verify_hash_days} fullhash={force_full_hash_large}")
+
+    
     cur = con.cursor()
     now = int(time.time())
     reindex_sec = max(0, reindex_days) * 86400
@@ -165,6 +171,7 @@ def index_root(
                                      "chunks": chunks_written, "secs": round(time.time()-t0,1)})
             except Exception:
                 cur.execute("INSERT OR IGNORE INTO files(path,status,last_seen) VALUES(?,?,?)", (fp, "error", now))
+                log.debug(f"index error path={fp}", exc_info=True)
                 continue
         if cancelled: break
 
@@ -173,6 +180,7 @@ def index_root(
         cur.execute(f"DELETE FROM files WHERE path IN ({ph})", tuple(existing_paths))
 
     con.commit()
+    log.debug(f"index_root done files_seen={files_seen} files_indexed={files_indexed} chunks={chunks_written}")
     if progress_cb:
         progress_cb({"files_seen": files_seen, "files_indexed": files_indexed,
                      "chunks": chunks_written, "secs": round(time.time()-t0,1),
