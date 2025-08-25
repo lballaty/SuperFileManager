@@ -1,0 +1,14 @@
+modes:
+  quick: true
+  full_depth: true
+scan:
+  exclude_dir: [".git","node_modules","dist","build","__pycache__","/proc","/sys","/dev","/Volumes","C:\Windows"]
+  max_read_bytes_per_file: 200000
+search:
+  top_k: 500
+resources:
+  auto: true
+  target_fraction: 0.5
+  min_free_gb: 1.0
+safety:
+  require_flag_for_full_fs: true
