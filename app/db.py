@@ -101,3 +101,31 @@ def set_setting(con, k, value):
         (k, json.dumps(value)),
     )
     con.commit()
+
+def normalize_time_units(con):
+    import sqlite3 as _sq
+    for col in ("mtime","created_at","last_indexed_at","hash_checked_at"):
+        try:
+            v = con.execute(f"SELECT MAX({col}) FROM files").fetchone()[0]
+            if v and v > 10**11:  # looks like milliseconds
+                con.execute(f"UPDATE files SET {col} = CAST({col}/1000 AS INTEGER) WHERE {col} > 10**11")
+                con.commit()
+        except _sq.Error:
+            pass
+
+
+# show timestaps in right pane view
+def file_meta(con, path: str):
+    cur = con.execute(
+        "SELECT size, mtime, created_at, last_indexed_at, hash_checked_at, blake3, sha1 "
+        "FROM files WHERE path=?",
+        (path,),
+    )
+    r = cur.fetchone()
+    if not r:
+        return None
+    return {
+        "size": r[0], "mtime": r[1], "created_at": r[2],
+        "last_indexed_at": r[3], "hash_checked_at": r[4],
+        "blake3": r[5], "sha1": r[6],
+    }

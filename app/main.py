@@ -5,13 +5,26 @@ import logging
 from .logging_conf import get_logger, log_path
 import re, time
 from . import db, indexer, searcher
+from .log_viewer import LogViewer
+import platform
 
-IS_MAC = (os.uname().sysname == "Darwin")
-DB_PATH = (os.path.expanduser("~/Library/Application Support/SuperFileManager/state.sqlite")
-           if IS_MAC else os.path.expanduser("~/.local/share/SuperFileManager/state.sqlite"))
+def _get_app_data_path():
+    """Get platform-appropriate application data directory."""
+    system = platform.system()
+    if system == "Darwin":
+        return os.path.expanduser("~/Library/Application Support/SuperFileManager")
+    elif system == "Windows":
+        appdata = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA')
+        return os.path.join(appdata, "SuperFileManager")
+    else:  # Linux/Unix
+        return os.path.expanduser("~/.local/share/SuperFileManager")
 
-CREATED_SUPPORTED = IS_MAC or (os.name == "nt")
-
+# Module constants
+IS_MAC = platform.system() == "Darwin"
+IS_WINDOWS = platform.system() == "Windows"
+CREATED_SUPPORTED = IS_MAC or IS_WINDOWS
+APP_DATA_DIR = _get_app_data_path()
+DB_PATH = os.path.join(APP_DATA_DIR, "state.sqlite")
 
 EXCLUDES = [".git","node_modules","dist","build","__pycache__",
             "/proc","/sys","/dev","/Volumes",
@@ -23,8 +36,13 @@ class App(tk.Tk):
         self.title("SuperFileManager"); self.geometry("1100x680")
         self.db_path = DB_PATH
         self.con: sqlite3.Connection = db.connect(self.db_path); db.init(self.con)
-        try: db.migrate(self.con)
-        except Exception: pass
+        try:
+            db.migrate(self.con)
+            if hasattr(db, "normalize_time_units"):
+                db.normalize_time_units(self.con)
+        except Exception:
+            pass
+
 
         self.work_q: "queue.Queue[tuple[str,dict]]" = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -40,7 +58,20 @@ class App(tk.Tk):
 
         self._build()
         self.after(150, self._poll)
-        self.update_stats()
+        self.after(0, self.update_stats)  # run after widgets exist
+
+
+    def _toggle_logging(self):
+        import logging as _lg
+        db.set_setting(self.con, "debug_logging", bool(self.debug_var.get()))
+        level = _lg.DEBUG if self.debug_var.get() else _lg.WARNING
+        self.log = get_logger("GUI", level=level)
+
+    def open_log_viewer(self):
+        from .log_viewer import LogViewer
+        LogViewer(self)
+
+    
 
     def _build(self):
         # top: root + index controls
@@ -52,13 +83,6 @@ class App(tk.Tk):
         self.btn_cancel = tk.Button(top, text="Cancel", command=self.cancel_index, state="disabled")
         self.btn_cancel.pack(side="left")
         self.bind_all("<Control-l>", lambda _e: self.clear_results())
-
-    def _toggle_logging(self):
-        import logging as _lg
-        db.set_setting(self.con, "debug_logging", bool(self.debug_var.get()))
-        level = _lg.DEBUG if self.debug_var.get() else _lg.WARNING
-        self.log = get_logger("GUI", level=level)
-
 
 
         # knobs row (reindex + verify + prune + fullhash)
@@ -74,6 +98,9 @@ class App(tk.Tk):
         self.fullhash_var = tk.BooleanVar(value=False)
         tk.Checkbutton(knobs, text="Full-hash large files", variable=self.fullhash_var).pack(side="left", padx=6)
 
+        tk.Checkbutton(knobs, text="Debug logging", variable=self.debug_var, command=self._toggle_logging).pack(side="left", padx=6) 
+ 
+  
         # search row + regex builder
         mid = tk.Frame(self); mid.pack(fill="x", padx=8, pady=(6,0))
         self.q_var = tk.StringVar()
@@ -89,6 +116,9 @@ class App(tk.Tk):
         self.regex_var = tk.BooleanVar()
         tk.Checkbutton(mid, text="Regex", variable=self.regex_var).pack(side="left", padx=(8,0))
         tk.Button(mid, text="Regex Builder…", command=self.open_regex_builder).pack(side="left", padx=6)
+
+        # log viewer
+        tk.Button(mid, text="Log Viewer…", command=self.open_log_viewer).pack(side="left", padx=(6,0))
 
         # time filter row
         trow = tk.Frame(self); trow.pack(fill="x", padx=8, pady=(4,0))
@@ -307,12 +337,35 @@ class App(tk.Tk):
         self.status.config(text=f"{min(300, len(rows))} results")
         self.log.debug(f"SEARCH query={q} results={len(rows)}")
 
+    def _fmt_ts(self, ts) -> str:
+        if not ts: return "—"
+        from time import localtime, strftime
+        return time.strftime("%Y-%m-%d %H:%M:%S", localtime(int(ts)))
+
+
 
     def show_preview(self, _evt=None):
         sel = self.listbox.curselection()
         if not sel: return
         line = self.listbox.get(sel[0])
-        self.preview.delete("1.0", tk.END); self.preview.insert("1.0", line)
+        path = line.split("  [chunk", 1)[0]
+
+        meta = db.file_meta(self.con, path)
+        out = [path]
+        if meta:
+            out.append(f"Modified:     {self._fmt_ts(meta.get('mtime'))}")
+            out.append(f"Created:      {self._fmt_ts(meta.get('created_at'))}")
+            out.append(f"Last indexed: {self._fmt_ts(meta.get('last_indexed_at'))}")
+            out.append(f"Hash checked: {self._fmt_ts(meta.get('hash_checked_at'))}")
+            if meta.get('size') is not None:
+                out.append(f"Size:         {meta['size']} bytes")
+        else:
+            out.append("No metadata found in DB.")
+
+        out += ["", "Snippet:", line]
+        self.preview.delete("1.0", tk.END)
+        self.preview.insert("1.0", "\n".join(out))
+
 
     # —— regex builder ——
     def open_regex_builder(self):
@@ -372,13 +425,20 @@ class App(tk.Tk):
 
     # —— stats + close ——
     def update_stats(self):
+        # ensure the StringVar exists even if called before _build() finishes
+        if not hasattr(self, "stats_var"):
+            self.stats_var = tk.StringVar(value="Stats: n/a")
+
         root = self.root_var.get().strip()
         if not root or not os.path.isdir(root):
-            self.stats_var.set("Stats: invalid directory"); return
+            self.stats_var.set("Stats: invalid directory")
+            return
         d = db.counts_for_root(self.con, root)
         from time import localtime, strftime
         ts = "—" if not d.get("last_indexed_at") else strftime("%Y-%m-%d %H:%M", localtime(d["last_indexed_at"]))
-        self.stats_var.set(f"Stats for {root}: files={d['files_total']}  text_files={d['files_text']}  chunks={d['chunks']}  last_indexed={ts}")
+        self.stats_var.set(
+            f"Stats for {root}: files={d['files_total']}  text_files={d['files_text']}  chunks={d['chunks']}  last_indexed={ts}"
+        )
 
     def on_close(self):
         self.cancel_index()

@@ -47,10 +47,9 @@ def fts(
     time_field: str = "modified",           # "modified" or "created"
 ) -> list[tuple]:
     cur = con.cursor()
-    col = "f.mtime" if time_field == "modified" else "f.created_at"
+    col = "f.mtime" if time_field == "modified" else "COALESCE(f.created_at, f.mtime)"
     qn = _normalize_fts_query(q)
     log.debug(f"fts args q={q!r} top_k={top_k} min_ts={min_ts} field={time_field} scopes={len(path_prefixes or [])}")
-
 
     # Build scope SQL
     prefixes = [_norm_prefix(p) for p in (path_prefixes or [])]
@@ -61,7 +60,6 @@ def fts(
         scope_params = [p + "%" for p in prefixes]
 
     if qn is None:
-        # SHOW-ALL: first chunk per file, newest first, WITH scope/time in SQL
         where = ["c.ord = 0"]
         params: List[object] = []
         if min_ts is not None:
@@ -75,10 +73,10 @@ def fts(
                   ORDER BY {col} DESC
                   LIMIT ?"""
         params.append(top_k)
+        log.debug("WHERE=%s params=%s", " AND ".join(where), params)
         cur.execute(sql, tuple(params))
         ids = [r[0] for r in cur.fetchall()]
     else:
-        # FTS mode: rank, WITH scope/time in SQL
         where = ["fts MATCH ?"]
         params: List[object] = [qn]
         if min_ts is not None:
@@ -94,13 +92,12 @@ def fts(
                   ORDER BY score
                   LIMIT ?"""
         params.append(top_k)
+        log.debug("WHERE=%s params=%s", " AND ".join(where), params)
         cur.execute(sql, tuple(params))
         ids = [r[0] for r in cur.fetchall()]
-        log.debug(f"fts ids={len(ids)}")
-
 
     if not ids:
-        log.debug(f"fts files={len(best)}")
+        log.debug("fts ids=0; files=0")
         return []
 
     ph = ",".join("?" * len(ids))
@@ -112,10 +109,11 @@ def fts(
     order = {cid: i for i, cid in enumerate(ids)}
     rows.sort(key=lambda r: order.get(r[0], 1e9))
 
-    # best chunk per file
     best = {}
     for cid, ord_, text, path in rows:
         best.setdefault(path, (cid, ord_, text, path))
+
+    log.debug("fts ids=%d; files=%d", len(ids), len(best))
     return list(best.values())
 
 

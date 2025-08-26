@@ -3,12 +3,17 @@ import logging, os, pathlib
 from logging.handlers import RotatingFileHandler
 
 def _data_dir():
-    if os.uname().sysname == "Darwin":
+    import platform
+    system = platform.system()
+    if system == "Darwin":
         base = os.path.expanduser("~/Library/Application Support/SuperFileManager")
+    elif system == "Windows":
+        base = os.path.expanduser("~/AppData/Local/SuperFileManager")
     else:
         base = os.path.expanduser("~/.local/share/SuperFileManager")
     pathlib.Path(base, "logs").mkdir(parents=True, exist_ok=True)
     return os.path.join(base, "logs", "sfm.log")
+
 
 _logger = None
 

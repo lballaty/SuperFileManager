@@ -50,15 +50,34 @@ def _get_row(cur: sqlite3.Cursor, path: str):
                    FROM files WHERE path=?""", (path,))
     return cur.fetchone()
 
+
 def _upsert_meta(cur: sqlite3.Cursor, path: str, st) -> int:
+    # compute created_at in **seconds**
+    try:
+        created = int(st.st_birthtime)            # macOS
+    except AttributeError:
+        created = int(st.st_ctime) if os.name == "nt" else None  # Windows or None on Linux
+
+    now = int(time.time())
     cur.execute(
-        "INSERT INTO files(path,size,mtime,inode,status,last_seen) VALUES(?,?,?,?,?,?) "
-        "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, "
-        "inode=excluded.inode, last_seen=excluded.last_seen, status='ok'",
-        (path, st.st_size, int(st.st_mtime), f"{st.st_ino}", "ok", int(time.time()))
+        """
+        INSERT INTO files(path,size,mtime,created_at,inode,status,last_seen)
+        VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(path) DO UPDATE SET
+            size       = excluded.size,
+            mtime      = excluded.mtime,
+            inode      = excluded.inode,
+            last_seen  = excluded.last_seen,
+            status     = 'ok',
+            -- only fill created_at if it was NULL before
+            created_at = COALESCE(files.created_at, excluded.created_at)
+        """,
+        (path, int(st.st_size), int(st.st_mtime), created, str(st.st_ino), "ok", now),
     )
-    cur.execute("SELECT id FROM files WHERE path=?", (path,))
-    return cur.fetchone()[0]
+    fid = cur.execute("SELECT id FROM files WHERE path=?", (path,)).fetchone()[0]
+    return fid
+
+
 
 def index_root(
     con: sqlite3.Connection,
@@ -118,8 +137,9 @@ def index_root(
                     fid = _upsert_meta(cur, fp, st)
 
                     ca = _get_created_at(st)
-                    if ca is not None:
-                        cur.execute("UPDATE files SET created_at=? WHERE id=?", (ca, fid))
+                if ca is not None:
+                    cur.execute("UPDATE files SET created_at = COALESCE(created_at, ?) WHERE id=?", (ca, fid))
+
 
 
                     # checksum lane
